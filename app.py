@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+import tempfile
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -9,12 +10,6 @@ import streamlit as st
 
 
 BASE_DIR = Path(__file__).resolve().parent
-os.chdir(BASE_DIR)
-
-CONFIG_XLSX = BASE_DIR / "config_template_user_input.xlsx"
-FINAL_OUTPUT = BASE_DIR / "outreach_rankings.xlsx"
-RUN_PIPELINE = BASE_DIR / "run_pipeline.py"
-
 
 DEFAULT_START = date.today() - timedelta(days=5 * 365)
 DEFAULT_END = date.today()
@@ -122,43 +117,18 @@ IBD_OUTREACH_REF = pd.DataFrame({
 })
 
 
-def drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    return df.loc[:, ~df.columns.astype(str).str.contains(r"^Unnamed")]
-
-
 def safe_text(value, default=""):
     if pd.isna(value):
         return default
     text = str(value).strip()
-    if text.lower() == "nan":
+    if text.lower() in ["nan", "none"]:
         return default
     return text
-
-
-def safe_int(value, default):
-    try:
-        if pd.isna(value) or str(value).strip() == "":
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
-def safe_date(value, default):
-    try:
-        if pd.isna(value) or str(value).strip() == "":
-            return default
-        return pd.to_datetime(value).date()
-    except Exception:
-        return default
 
 
 def clean_user_columns(df: pd.DataFrame, wanted_cols: list[str], fallback: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         df = fallback.copy()
-    else:
-        df = drop_unnamed(df)
 
     for col in wanted_cols:
         if col not in df.columns:
@@ -177,28 +147,8 @@ def clean_user_columns(df: pd.DataFrame, wanted_cols: list[str], fallback: pd.Da
     return df
 
 
-def load_existing_input():
-    if not CONFIG_XLSX.exists():
-        return {
-            "project": {
-                "project_name": "",
-                "ncbi_email": "",
-                "start_date": DEFAULT_START,
-                "end_date": DEFAULT_END,
-                "max_papers": 300,
-                "min_article_score": 10,
-            },
-            "search": DEFAULT_SEARCH_USER.copy(),
-            "relevance": DEFAULT_RELEVANCE_USER.copy(),
-            "outreach": DEFAULT_OUTREACH_USER.copy(),
-        }
-
-    try:
-        sheets = pd.read_excel(CONFIG_XLSX, sheet_name=None)
-    except Exception:
-        sheets = {}
-
-    project = {
+def get_blank_project():
+    return {
         "project_name": "",
         "ncbi_email": "",
         "start_date": DEFAULT_START,
@@ -207,30 +157,18 @@ def load_existing_input():
         "min_article_score": 10,
     }
 
-    project_sheet = sheets.get("Project")
-    if project_sheet is not None and not project_sheet.empty:
-        project_sheet = drop_unnamed(project_sheet)
-        config = {}
 
-        for _, row in project_sheet.iterrows():
-            param = safe_text(row.get("Parameter", ""))
-            value = row.get("Value", "")
-            if param:
-                config[param] = value
-
-        project["project_name"] = safe_text(config.get("Project Name", ""), "")
-        project["ncbi_email"] = safe_text(config.get("NCBI Email", ""), "")
-        project["start_date"] = safe_date(config.get("Start Date", ""), DEFAULT_START)
-        project["end_date"] = safe_date(config.get("End Date", ""), DEFAULT_END)
-        project["max_papers"] = safe_int(config.get("Max Papers", ""), 300)
-        project["min_article_score"] = safe_int(config.get("Min Article Score", ""), 10)
-
-    return {
-        "project": project,
-        "search": clean_user_columns(sheets.get("Search Terms"), ["User Term", "Include?"], DEFAULT_SEARCH_USER),
-        "relevance": clean_user_columns(sheets.get("Relevance Scores"), ["User Keyword", "User Score"], DEFAULT_RELEVANCE_USER),
-        "outreach": clean_user_columns(sheets.get("Outreach Signals"), ["User Signal Group", "User Keyword", "User Score"], DEFAULT_OUTREACH_USER),
-    }
+def init_session_state():
+    # Each browser session gets its own blank state.
+    # This prevents different users from seeing or overwriting one another's inputs.
+    if "project" not in st.session_state:
+        st.session_state.project = get_blank_project()
+    if "search" not in st.session_state:
+        st.session_state.search = DEFAULT_SEARCH_USER.copy()
+    if "relevance" not in st.session_state:
+        st.session_state.relevance = DEFAULT_RELEVANCE_USER.copy()
+    if "outreach" not in st.session_state:
+        st.session_state.outreach = DEFAULT_OUTREACH_USER.copy()
 
 
 def build_project_sheet(project_name, ncbi_email, start_date, end_date, max_papers, min_article_score):
@@ -262,12 +200,12 @@ def build_project_sheet(project_name, ncbi_email, start_date, end_date, max_pape
     })
 
 
-def save_config_excel(project_df, search_df, relevance_df, outreach_df):
+def save_config_excel(config_xlsx: Path, project_df, search_df, relevance_df, outreach_df):
     search_df = clean_user_columns(search_df, ["User Term", "Include?"], DEFAULT_SEARCH_USER)
     relevance_df = clean_user_columns(relevance_df, ["User Keyword", "User Score"], DEFAULT_RELEVANCE_USER)
     outreach_df = clean_user_columns(outreach_df, ["User Signal Group", "User Keyword", "User Score"], DEFAULT_OUTREACH_USER)
 
-    with pd.ExcelWriter(CONFIG_XLSX, engine="openpyxl") as writer:
+    with pd.ExcelWriter(config_xlsx, engine="openpyxl") as writer:
         project_df.to_excel(writer, sheet_name="Project", index=False)
 
         search_out = pd.concat(
@@ -289,9 +227,10 @@ def save_config_excel(project_df, search_df, relevance_df, outreach_df):
         outreach_out.to_excel(writer, sheet_name="Outreach Signals", index=False)
 
 
-def run_pipeline():
+def run_pipeline(run_dir: Path):
+    run_pipeline_file = BASE_DIR / "run_pipeline.py"
     return subprocess.run(
-        [sys.executable, str(RUN_PIPELINE)],
+        [sys.executable, str(run_pipeline_file), str(run_dir)],
         cwd=BASE_DIR,
         capture_output=True,
         text=True,
@@ -320,12 +259,12 @@ def validate_inputs(project_name, ncbi_email, search_df, relevance_df):
 
 st.set_page_config(page_title="Outreach Ranking Tool", page_icon="📊", layout="wide")
 
+init_session_state()
+
 st.title("Outreach Ranking Tool")
 st.caption("Enter project settings and scoring keywords, then generate an outreach ranking Excel file.")
 
-loaded = load_existing_input()
-
-project = loaded["project"]
+project = st.session_state.project
 
 st.subheader("1. Project Settings")
 
@@ -383,15 +322,13 @@ project_df = build_project_sheet(
 st.subheader("2. Search Terms")
 st.caption("Only User Term and Include? are used. IBD examples are shown below for guidance.")
 
-search_input = loaded["search"].copy()
-search_input["User Term"] = search_input["User Term"].fillna("").astype(str)
+search_input = st.session_state.search.copy()
 search_input["User Term"] = (
     search_input["User Term"]
     .fillna("")
     .astype(str)
     .replace(["nan", "None"], "")
 )
-
 search_input["Include?"] = (
     search_input["Include?"]
     .fillna("yes")
@@ -402,7 +339,7 @@ search_input["Include?"] = (
 search_df = st.data_editor(
     search_input,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     key="search_editor",
     column_config={
         "User Term": st.column_config.TextColumn("User Term", help="Disease/search term to include in PubMed query."),
@@ -411,13 +348,13 @@ search_df = st.data_editor(
 )
 
 with st.expander("View IBD reference search terms"):
-    st.dataframe(IBD_SEARCH_REF, use_container_width=True, hide_index=True)
+    st.dataframe(IBD_SEARCH_REF, width="stretch", hide_index=True)
 
 st.subheader("3. Relevance Scores")
 st.caption("These keywords score paper relevance. Empty rows are skipped. Blank/non-numeric scores default to 5.")
 
 relevance_input = (
-    loaded["relevance"]
+    st.session_state.relevance
     .copy()
     .fillna("")
     .replace(["nan", "None"], "")
@@ -438,7 +375,7 @@ relevance_input["User Score"] = (
 relevance_df = st.data_editor(
     relevance_input,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     key="relevance_editor",
     column_config={
         "User Keyword": st.column_config.TextColumn("User Keyword", help="Keyword used to score article relevance."),
@@ -447,13 +384,13 @@ relevance_df = st.data_editor(
 )
 
 with st.expander("View IBD reference relevance scores"):
-    st.dataframe(IBD_RELEVANCE_REF, use_container_width=True, hide_index=True)
+    st.dataframe(IBD_RELEVANCE_REF, width="stretch", hide_index=True)
 
 st.subheader("4. Outreach Signals")
 st.caption("These keywords score author outreach fit. Empty rows are skipped. Blank/non-numeric scores default to 5.")
 
 outreach_input = (
-    loaded["outreach"]
+    st.session_state.outreach
     .copy()
     .fillna("")
     .replace(["nan", "None"], "")
@@ -480,7 +417,7 @@ outreach_input["User Score"] = (
 outreach_df = st.data_editor(
     outreach_input,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     key="outreach_editor",
     column_config={
         "User Signal Group": st.column_config.TextColumn("User Signal Group", help="Signal category, e.g. Clinical Trial."),
@@ -490,7 +427,7 @@ outreach_df = st.data_editor(
 )
 
 with st.expander("View IBD reference outreach signals"):
-    st.dataframe(IBD_OUTREACH_REF, use_container_width=True, hide_index=True)
+    st.dataframe(IBD_OUTREACH_REF, width="stretch", hide_index=True)
 
 st.divider()
 
@@ -502,15 +439,20 @@ if st.button("Generate Outreach Ranking", type="primary"):
             st.error(error)
         st.stop()
 
-    save_config_excel(project_df, search_df, relevance_df, outreach_df)
+    # One isolated folder per run. This prevents users from overwriting each other.
+    run_dir = Path(tempfile.mkdtemp(prefix="outreach_run_"))
+    config_xlsx = run_dir / "config_template_user_input.xlsx"
+    final_output = run_dir / "outreach_rankings.xlsx"
+
+    save_config_excel(config_xlsx, project_df, search_df, relevance_df, outreach_df)
 
     with st.spinner("Running pipeline. This may take several minutes..."):
-        result = run_pipeline()
+        result = run_pipeline(run_dir)
 
-    if result.returncode == 0 and FINAL_OUTPUT.exists():
+    if result.returncode == 0 and final_output.exists():
         st.success("Outreach ranking generated successfully.")
 
-        with open(FINAL_OUTPUT, "rb") as f:
+        with open(final_output, "rb") as f:
             st.download_button(
                 label="Download outreach_rankings.xlsx",
                 data=f,

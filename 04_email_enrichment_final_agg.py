@@ -11,26 +11,17 @@ import requests
 # =========================
 # CONFIG
 # =========================
-from config import (
-    NCBI_EMAIL,
-    PAPERS_SCORED_FILE,
-    AUTHOR_AGG_V2_FILE,
-    AUTHOR_EMAIL_SUMMARY_FILE,
-    AUTHOR_EMAIL_CANDIDATES_FILE,
-    AUTHOR_AFFILIATION_SUMMARY_FILE,
-    AUTHOR_MASTER_FILE,
-    FINAL_XLSX,
-)
-
-AUTHOR_AGG = AUTHOR_AGG_V2_FILE
-IBD_PAPERS = PAPERS_SCORED_FILE
-AFFILIATION_SUMMARY = AUTHOR_AFFILIATION_SUMMARY_FILE
-PUBMED_SUMMARY = AUTHOR_EMAIL_SUMMARY_FILE
-PUBMED_CANDIDATES = AUTHOR_EMAIL_CANDIDATES_FILE
+AUTHOR_AGG = "author_aggregation_v2.csv"
+IBD_PAPERS = "ibd_papers_scored.csv"  # optional, used to build all-author affiliation database
+AFFILIATION_SUMMARY = "author_affiliation_summary.csv"
+PUBMED_SUMMARY = "author_email_summary.csv"             # from 03_pubmed_email_extractor.py
+PUBMED_CANDIDATES = "author_email_candidates.csv"       # from 03_pubmed_email_extractor.py
 MULTISOURCE_XLSX = ""
 
-MASTER_CSV = AUTHOR_MASTER_FILE
+MASTER_CSV = "author_aggregation_master.csv"
+FINAL_XLSX = "outreach_rankings.xlsx"
 
+NCBI_EMAIL = "elynyu21@gmail.com"
 BATCH_SIZE = 100
 DELAY = 0.35
 
@@ -494,12 +485,38 @@ def main():
     df["Inferred_Email_Evidence"] = inferred_ev
 
     # Add preferred email for actual outreach.
-    df["Preferred_Email"] = df["Email"].where(df["Email"].astype(str).str.contains("@"), df["Inferred_Email"])
-    df["Preferred_Email_Status"] = df.apply(
-        lambda r: "confirmed" if "@" in clean(r.get("Email", "")) else (
-            "inferred" if "@" in clean(r.get("Inferred_Email", "")) else "missing"
-        ), axis=1
-    )
+    # Confirmed PubMed-affiliation emails are safe to use directly.
+    # Inferred emails are only promoted to Best Email when confidence is high;
+    # medium/low confidence inferred emails are kept separately for manual review.
+    preferred_emails = []
+    preferred_statuses = []
+    review_emails = []
+
+    for _, r in df.iterrows():
+        confirmed = clean(r.get("Email", ""))
+        inferred_email = clean(r.get("Inferred_Email", ""))
+        inferred_conf = clean(r.get("Inferred_Email_Confidence", "")).lower()
+
+        if "@" in confirmed:
+            preferred_emails.append(confirmed)
+            preferred_statuses.append("confirmed_from_pubmed_affiliation")
+            review_emails.append("")
+        elif "@" in inferred_email and inferred_conf.startswith("high"):
+            preferred_emails.append(inferred_email)
+            preferred_statuses.append("inferred_high_confidence")
+            review_emails.append("")
+        elif "@" in inferred_email:
+            preferred_emails.append("")
+            preferred_statuses.append("inferred_needs_review")
+            review_emails.append(inferred_email)
+        else:
+            preferred_emails.append("")
+            preferred_statuses.append("missing")
+            review_emails.append("")
+
+    df["Preferred_Email"] = preferred_emails
+    df["Preferred_Email_Status"] = preferred_statuses
+    df["Email_To_Review"] = review_emails
 
     # 1) Full working file for internal review/debugging
     df.to_csv(MASTER_CSV, index=False, encoding="utf-8-sig")
@@ -518,26 +535,38 @@ def main():
         "Relevant_Paper_Count",
         "Average_Article_Score",
         "Max_Article_Score",
-        "Years",
         "ImmPro Interest Score",
         "Strategic Fit Score",
         "Example_Titles",
         "Interest Signals",
-        "Faculty Search Query",
-        "Email Search Query",
-        "Program Query",
-        "Clinical Trial Query",
-        "Industry Collaboration Query",
-        "Google Scholar Query",
-        "Manual Notes",
     ]
     final = df[[c for c in keep_cols if c in df.columns]].copy()
 
+    final = final.rename(columns={
+        "Author": "Author Name",
+        "Institution": "Institution / School",
+        "Affiliation": "Raw Affiliation",
+        "Preferred_Email": "Best Email",
+        "Preferred_Email_Status": "Email Status",
+        "Email_To_Review": "Email To Review",
+        "Email": "Confirmed Email",
+        "Author_Expertise_Score": "Author Expertise Score",
+        "Relevant_Paper_Count": "Relevant Paper Count",
+        "Average_Article_Score": "Average Article Score",
+        "Max_Article_Score": "Max Article Score",
+        "ImmPro Interest Score": "Outreach Signal Score",
+        "Representative_PMIDs": "Representative PMIDs",
+        "Representative_Article_Titles": "Representative Article Titles",
+        "Representative_PubMed_Links": "PubMed Article Links",
+        "Representative_DOIs": "DOI Links",
+        "Matched_Keywords": "Matched Relevance Keywords",
+    })
+
     # 2) Clean final deliverable for Jack: three ranking sheets
     with pd.ExcelWriter(FINAL_XLSX, engine="openpyxl") as writer:
-        if "Author_Expertise_Score" in final.columns:
+        if "Author Expertise Score" in final.columns:
             final.sort_values(
-                by="Author_Expertise_Score",
+                by="Author Expertise Score",
                 ascending=False
             ).to_excel(
                 writer,
@@ -545,13 +574,13 @@ def main():
                 index=False
             )
 
-        if "ImmPro Interest Score" in final.columns:
+        if "Outreach Signal Score" in final.columns:
             final.sort_values(
-                by="ImmPro Interest Score",
+                by="Outreach Signal Score",
                 ascending=False
             ).to_excel(
                 writer,
-                sheet_name="Top ImmPro Fits",
+                sheet_name="Top Outreach Fits",
                 index=False
             )
 
@@ -569,6 +598,18 @@ def main():
                 writer,
                 sheet_name="Balanced Ranking",
                 index=False
+            )
+
+        if Path(IBD_PAPERS).exists():
+            papers = pd.read_csv(IBD_PAPERS)
+            article_cols = [
+                "PMID", "Title", "Journal", "Year", "DOI", "PubMed_Link", "DOI_Link",
+                "Authors", "Relevance Score", "Matched Keywords"
+            ]
+            papers[[c for c in article_cols if c in papers.columns]].to_excel(
+                writer,
+                sheet_name="Article Details",
+                index=False,
             )
 
     print("DONE")

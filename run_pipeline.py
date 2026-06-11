@@ -5,11 +5,14 @@ import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-os.chdir(BASE_DIR)
+RUN_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else BASE_DIR
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+os.chdir(RUN_DIR)
 
 READ_EXCEL_CONFIG = BASE_DIR / "read_excel_config.py"
-CONFIG_TEMPLATE = BASE_DIR / "config_template_user_input.xlsx"
-CONFIG_FILE = BASE_DIR / "config.py"
+CONFIG_TEMPLATE = RUN_DIR / "config_template_user_input.xlsx"
+CONFIG_FILE = RUN_DIR / "config.py"
 
 SCRIPTS = [
     READ_EXCEL_CONFIG,
@@ -19,8 +22,8 @@ SCRIPTS = [
     BASE_DIR / "04_email_enrichment_final_agg.py",
 ]
 
-FINAL_OUTPUT = BASE_DIR / "outreach_rankings.xlsx"
-ARCHIVE_DIR = BASE_DIR / "intermediate_outputs"
+FINAL_OUTPUT = RUN_DIR / "outreach_rankings.xlsx"
+ARCHIVE_DIR = RUN_DIR / "intermediate_outputs"
 
 INTERMEDIATE_FILES = [
     "papers_scored.csv",
@@ -40,9 +43,17 @@ def run_script(script_path: Path) -> None:
     if not script_path.exists():
         raise FileNotFoundError(f"Missing script: {script_path}")
 
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(RUN_DIR) + os.pathsep + str(BASE_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+
+    args = [sys.executable, str(script_path)]
+    if script_path.name == "read_excel_config.py":
+        args.append(str(RUN_DIR))
+
     result = subprocess.run(
-        [sys.executable, str(script_path)],
-        cwd=BASE_DIR,
+        args,
+        cwd=RUN_DIR,
+        env=env,
     )
 
     if result.returncode != 0:
@@ -55,7 +66,7 @@ def archive_intermediates() -> None:
     ARCHIVE_DIR.mkdir(exist_ok=True)
 
     for file_name in INTERMEDIATE_FILES:
-        source = BASE_DIR / file_name
+        source = RUN_DIR / file_name
         if not source.exists():
             continue
 
@@ -72,7 +83,7 @@ def archive_intermediates() -> None:
 def main() -> None:
     if not CONFIG_TEMPLATE.exists():
         raise FileNotFoundError(
-            f"Missing {CONFIG_TEMPLATE.name}. Put it in the same folder as run_pipeline.py."
+            f"Missing {CONFIG_TEMPLATE.name}. Put it in the run folder."
         )
 
     for script in SCRIPTS:
