@@ -1,8 +1,9 @@
+
 import re
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from collections import defaultdict, Counter
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +36,7 @@ BAD_EMAIL_PARTS = [
     "admin@", "info@", "newsletter", "media@", "press@", "careers@", "jobs@", "help@"
 ]
 GENERIC_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com"}
+LOW_TRUST_DOMAINS = GENERIC_DOMAINS | {"qq.com", "126.com", "163.com", "sina.com", "yeah.net"}
 
 
 def clean(x):
@@ -82,112 +84,43 @@ def email_domain(email):
     return email.split("@")[-1].lower() if "@" in email else ""
 
 
-def choose_best_email(author, emails):
+def email_name_match_score(author, email):
     first, _, last = name_parts(author)
-    emails = list(dict.fromkeys(emails))
-
-    def score(e):
-        local = e.split("@")[0].lower().replace("-", ".").replace("_", ".")
-        compact = local.replace(".", "")
-        s = 0
-        if last and last in local:
-            s += 10
-        if first and first in local:
-            s += 6
-        if first and last and compact.startswith(first[0] + last[:4]):
-            s += 5
-        if first and last and local == f"{first}.{last}":
-            s += 5
-        if email_domain(e) not in GENERIC_DOMAINS:
-            s += 2
-        return s
-
-    return sorted(emails, key=score, reverse=True)[0] if emails else ""
-
-
-def classify_pattern(author, email):
-    first, middle, last = name_parts(author)
     if not first or not last or "@" not in email:
-        return "unknown"
+        return 0
 
-    local = email.split("@")[0].lower().replace("_", ".").replace("-", ".")
+    local = email.split("@")[0].lower().replace("-", ".").replace("_", ".")
     compact = local.replace(".", "")
+    score = 0
 
-    exact = {
-        "first.last": f"{first}.{last}",
-        "first_initial.last": f"{first[0]}.{last}",
-        "first_initiallast": f"{first[0]}{last}",
-        "firstlast": f"{first}{last}",
-        "last.first": f"{last}.{first}",
-        "first": first,
-        "last": last,
-    }
+    if local == f"{first}.{last}":
+        score += 20
+    if local == f"{first[0]}.{last}":
+        score += 18
+    if compact == f"{first}{last}":
+        score += 18
+    if compact == f"{first[0]}{last}":
+        score += 16
+    if last in local:
+        score += 10
+    if first in local:
+        score += 6
+    if compact.startswith(first[0] + last[:4]):
+        score += 5
+    if email_domain(email) not in LOW_TRUST_DOMAINS:
+        score += 2
 
-    if middle:
-        exact["first.middle.last"] = f"{first}.{middle}.{last}"
-        exact["first.middle_initial.last"] = f"{first}.{middle[0]}.{last}"
-
-    for pat, expected in exact.items():
-        if local == expected or compact == expected.replace(".", ""):
-            return pat
-
-    for n in range(min(len(last), 12), 3, -1):
-        if compact == f"{first[0]}{last[:n]}":
-            return f"first_initiallast_prefix{n}"
-
-    for n in range(min(len(last), 12), 3, -1):
-        if compact == f"{first}{last[:n]}":
-            return f"firstlast_prefix{n}"
-
-    return "unknown"
+    return score
 
 
-def generate_email(author, domain, pattern):
-    first, middle, last = name_parts(author)
-    if not first or not last or not domain:
-        return ""
+def choose_best_email(author, emails):
+    emails = list(dict.fromkeys([e for e in emails if "@" in e]))
+    if not emails:
+        return "", 0
 
-    if pattern == "first.last":
-        local = f"{first}.{last}"
-    elif pattern == "first_initial.last":
-        local = f"{first[0]}.{last}"
-    elif pattern == "first_initiallast":
-        local = f"{first[0]}{last}"
-    elif pattern == "firstlast":
-        local = f"{first}{last}"
-    elif pattern == "last.first":
-        local = f"{last}.{first}"
-    elif pattern == "first":
-        local = first
-    elif pattern == "last":
-        local = last
-    elif pattern == "first.middle.last" and middle:
-        local = f"{first}.{middle}.{last}"
-    elif pattern == "first.middle_initial.last" and middle:
-        local = f"{first}.{middle[0]}.{last}"
-    elif pattern.startswith("first_initiallast_prefix"):
-        n = int(pattern.replace("first_initiallast_prefix", ""))
-        local = f"{first[0]}{last[:n]}"
-    elif pattern.startswith("firstlast_prefix"):
-        n = int(pattern.replace("firstlast_prefix", ""))
-        local = f"{first}{last[:n]}"
-    else:
-        return ""
-
-    return f"{local}@{domain}"
-
-
-def confidence_rank(conf):
-    text = clean(conf).lower()
-    if text.startswith("high"):
-        return 3
-    if text.startswith("medium"):
-        return 2
-    if text.startswith("low"):
-        return 1
-    if "confirmed" in text:
-        return 4
-    return 0
+    scored = [(e, email_name_match_score(author, e)) for e in emails]
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)
+    return scored[0]
 
 
 def safe_text(el):
@@ -204,6 +137,7 @@ def get_author_name(author_el):
 def build_affiliation_summary_if_possible():
     if Path(AFFILIATION_SUMMARY).exists():
         return
+
     if not Path(PAPERS_FILE).exists():
         print(f"Warning: {AFFILIATION_SUMMARY} and {PAPERS_FILE} not found.")
         return
@@ -307,37 +241,87 @@ def load_sources():
     return records_exact, records_sig
 
 
-def build_final_columns(df):
-    preferred = []
-    status = []
-    review_email = []
+def collect_email_candidates(df, records_exact, records_sig):
+    all_rows = []
+    candidate_map = {}
+    evidence_map = {}
 
     for _, row in df.iterrows():
-        direct = clean(row.get("Email", ""))
-        inferred_email = clean(row.get("Inferred_Email", ""))
-        inferred_conf = clean(row.get("Inferred_Email_Confidence", ""))
+        author = clean(row.get("Author", ""))
+        exact = norm_name(author)
+        sig = name_signature(author)
 
-        if "@" in direct:
-            preferred.append(direct)
-            status.append("confirmed_from_pubmed_affiliation")
-            review_email.append("")
-        elif "@" in inferred_email and confidence_rank(inferred_conf) >= 3:
-            preferred.append(inferred_email)
-            status.append("inferred_high_confidence")
-            review_email.append("")
-        elif "@" in inferred_email:
-            preferred.append("")
-            status.append("inferred_needs_review")
-            review_email.append(inferred_email)
-        else:
-            preferred.append("")
-            status.append("missing")
-            review_email.append("")
+        row_text = " || ".join(clean(v) for v in row.values)
+        all_emails = extract_emails(row_text)
+        evidence = []
 
-    df["Preferred_Email"] = preferred
-    df["Preferred_Email_Status"] = status
-    df["Email_To_Review"] = review_email
+        for rec in [records_exact.get(exact, {}), records_sig.get(sig, {})]:
+            all_emails.extend(rec.get("emails", []))
+            evidence.extend(rec.get("evidence", []))
 
+        all_emails = list(dict.fromkeys(all_emails))
+        candidate_map[author] = all_emails
+        evidence_map[author] = " || ".join(list(dict.fromkeys(evidence))[:8])
+
+        for email in all_emails:
+            all_rows.append({
+                "Author": author,
+                "Email": email,
+                "Institution": clean(row.get("Institution", "")),
+                "Email_Match_Score": email_name_match_score(author, email),
+            })
+
+    usage_df = pd.DataFrame(all_rows)
+    if usage_df.empty:
+        return candidate_map, evidence_map, {}, {}
+
+    usage = usage_df.groupby("Email")["Author"].nunique().to_dict()
+    institution_usage = usage_df.groupby("Email")["Institution"].nunique().to_dict()
+    return candidate_map, evidence_map, usage, institution_usage
+
+
+def classify_email_for_author(author, email, usage, institution_usage):
+    if not email:
+        return {"best_email": "", "status": "missing", "review_email": "", "score": 0}
+
+    score = email_name_match_score(author, email)
+    domain = email_domain(email)
+    author_count = usage.get(email, 0)
+    institution_count = institution_usage.get(email, 0)
+
+    if author_count > 1:
+        return {
+            "best_email": "",
+            "status": f"shared_email_needs_review; authors={author_count}; institutions={institution_count}",
+            "review_email": email,
+            "score": score,
+        }
+
+    if domain in LOW_TRUST_DOMAINS and score < 12:
+        return {
+            "best_email": "",
+            "status": "affiliation_email_needs_review_low_name_match",
+            "review_email": email,
+            "score": score,
+        }
+
+    if score >= 12:
+        return {
+            "best_email": email,
+            "status": "author_matched_affiliation_email",
+            "review_email": "",
+            "score": score,
+        }
+
+    return {
+        "best_email": "",
+        "status": "affiliation_email_needs_review",
+        "review_email": email,
+        "score": score,
+    }
+
+
+def build_final_columns(df):
     keep_cols = [
         "Author",
         "Institution",
@@ -346,12 +330,9 @@ def build_final_columns(df):
         "Preferred_Email",
         "Preferred_Email_Status",
         "Email_To_Review",
-        "Email",
+        "Email_Match_Score",
         "Email_Evidence",
-        "Inferred_Email",
-        "Inferred_Email_Confidence",
-        "Inferred_Email_Pattern",
-        "Inferred_Email_Evidence",
+        "All_Email_Candidates",
         "Author_Expertise_Score",
         "Relevant_Paper_Count",
         "Average_Article_Score",
@@ -384,10 +365,9 @@ def build_final_columns(df):
         "Preferred_Email": "Best Email",
         "Preferred_Email_Status": "Email Status",
         "Email_To_Review": "Email To Review",
-        "Email": "Confirmed Email",
+        "Email_Match_Score": "Email Match Score",
+        "All_Email_Candidates": "All Email Candidates",
         "Email_Evidence": "Email Evidence",
-        "Inferred_Email": "Inferred Email",
-        "Inferred_Email_Confidence": "Inferred Email Confidence",
         "Author_Expertise_Score": "Author Expertise Score",
         "Relevant_Paper_Count": "Relevant Paper Count",
         "Average_Article_Score": "Average Article Score",
@@ -416,40 +396,40 @@ def main():
         return
 
     records_exact, records_sig = load_sources()
+    candidate_map, evidence_map, usage, institution_usage = collect_email_candidates(df, records_exact, records_sig)
 
-    emails = []
-    email_evidence = []
+    preferred_emails = []
+    preferred_statuses = []
+    review_emails = []
+    match_scores = []
+    all_candidates = []
+    evidence_lines = []
 
     for _, row in df.iterrows():
         author = clean(row.get("Author", ""))
-        exact = norm_name(author)
-        sig = name_signature(author)
+        candidates = candidate_map.get(author, [])
+        best_candidate, _ = choose_best_email(author, candidates)
 
-        row_text = " || ".join(clean(v) for v in row.values)
-        all_emails = extract_emails(row_text)
-        ev = []
+        classified = classify_email_for_author(
+            author=author,
+            email=best_candidate,
+            usage=usage,
+            institution_usage=institution_usage,
+        )
 
-        for rec in [records_exact.get(exact, {}), records_sig.get(sig, {})]:
-            all_emails.extend(rec.get("emails", []))
-            ev.extend(rec.get("evidence", []))
+        preferred_emails.append(classified["best_email"])
+        preferred_statuses.append(classified["status"])
+        review_emails.append(classified["review_email"])
+        match_scores.append(classified["score"])
+        all_candidates.append("; ".join(candidates))
+        evidence_lines.append(evidence_map.get(author, ""))
 
-        best = choose_best_email(author, all_emails)
-        emails.append(best)
-
-        evidence_line = []
-        if best:
-            evidence_line.append(f"direct_or_source_text: {best}")
-        evidence_line.extend(list(dict.fromkeys(ev))[:6])
-        email_evidence.append(" || ".join(evidence_line))
-
-    df["Email"] = emails
-    df["Email_Evidence"] = email_evidence
-
-    # Conservative inference placeholder: do not promote guessed emails unless future sources support it.
-    df["Inferred_Email"] = ""
-    df["Inferred_Email_Pattern"] = ""
-    df["Inferred_Email_Confidence"] = "not_inferred"
-    df["Inferred_Email_Evidence"] = ""
+    df["Preferred_Email"] = preferred_emails
+    df["Preferred_Email_Status"] = preferred_statuses
+    df["Email_To_Review"] = review_emails
+    df["Email_Match_Score"] = match_scores
+    df["All_Email_Candidates"] = all_candidates
+    df["Email_Evidence"] = evidence_lines
 
     final = build_final_columns(df)
     df.to_csv(MASTER_CSV, index=False, encoding="utf-8-sig")
@@ -457,23 +437,17 @@ def main():
     with pd.ExcelWriter(FINAL_XLSX, engine="openpyxl") as writer:
         if "Author Expertise Score" in final.columns:
             final.sort_values(by="Author Expertise Score", ascending=False).to_excel(
-                writer,
-                sheet_name="Top Experts",
-                index=False,
+                writer, sheet_name="Top Experts", index=False
             )
 
         if "Outreach Signal Score" in final.columns:
             final.sort_values(by="Outreach Signal Score", ascending=False).to_excel(
-                writer,
-                sheet_name="Top Outreach Fits",
-                index=False,
+                writer, sheet_name="Top Outreach Fits", index=False
             )
 
         if "Strategic Fit Score" in final.columns:
             final.sort_values(by="Strategic Fit Score", ascending=False).to_excel(
-                writer,
-                sheet_name="Balanced Ranking",
-                index=False,
+                writer, sheet_name="Balanced Ranking", index=False
             )
         else:
             final.to_excel(writer, sheet_name="Balanced Ranking", index=False)
@@ -485,15 +459,14 @@ def main():
                 "DOI_Link", "Authors", "Relevance Score", "Matched Keywords"
             ]
             papers[[c for c in article_cols if c in papers.columns]].to_excel(
-                writer,
-                sheet_name="Article Details",
-                index=False,
+                writer, sheet_name="Article Details", index=False
             )
 
     print("DONE")
     print(f"Saved working file: {MASTER_CSV}")
     print(f"Saved final deliverable: {FINAL_XLSX}")
-    print(f"Confirmed emails: {df['Email'].astype(str).str.contains('@').sum()}")
+    print(f"Best emails: {final['Best Email'].astype(str).str.contains('@').sum() if 'Best Email' in final.columns else 0}")
+    print(f"Emails needing review: {final['Email To Review'].astype(str).str.contains('@').sum() if 'Email To Review' in final.columns else 0}")
 
 
 if __name__ == "__main__":
