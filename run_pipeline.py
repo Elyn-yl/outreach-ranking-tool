@@ -8,11 +8,15 @@ BASE_DIR = Path(__file__).resolve().parent
 RUN_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else BASE_DIR
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
+# IMPORTANT:
+# 03_2 publisher email extraction is intentionally disabled for now.
+# It can find article-level corresponding emails, but unless the corresponding
+# author name is reliably matched, it can incorrectly assign one email to every
+# author on the same paper.
 SOURCE_SCRIPT_NAMES = [
     "01_pubmed_search+aggregation.py",
     "02_outreach_enrichment.py",
     "03_1_pubmed_email_extractor.py",
-    "03_2_publisher_corresponding_email_extractor.py",
     "04_email_enrichment_final_agg.py",
 ]
 
@@ -38,17 +42,10 @@ INTERMEDIATE_FILES = [
 
 
 def prepare_run_folder() -> list[Path]:
-    """
-    Copy pipeline scripts into this user's temporary run folder.
-
-    Running copied scripts from RUN_DIR guarantees each user imports their own
-    generated config.py rather than a shared config.py from BASE_DIR.
-    """
     if not READ_EXCEL_CONFIG_SOURCE.exists():
         raise FileNotFoundError(f"Missing script: {READ_EXCEL_CONFIG_SOURCE}")
 
     shutil.copy2(READ_EXCEL_CONFIG_SOURCE, READ_EXCEL_CONFIG_RUN)
-
     run_scripts = [READ_EXCEL_CONFIG_RUN]
 
     for name in SOURCE_SCRIPT_NAMES:
@@ -67,9 +64,6 @@ def prepare_run_folder() -> list[Path]:
 def run_script(script_path: Path) -> None:
     print(f"\nRunning {script_path.name}...")
 
-    if not script_path.exists():
-        raise FileNotFoundError(f"Missing script: {script_path}")
-
     env = os.environ.copy()
     env["PYTHONPATH"] = str(RUN_DIR) + os.pathsep + env.get("PYTHONPATH", "")
 
@@ -77,11 +71,7 @@ def run_script(script_path: Path) -> None:
     if script_path.name == "read_excel_config.py":
         args.append(str(RUN_DIR))
 
-    result = subprocess.run(
-        args,
-        cwd=RUN_DIR,
-        env=env,
-    )
+    result = subprocess.run(args, cwd=RUN_DIR, env=env)
 
     if result.returncode != 0:
         raise RuntimeError(f"{script_path.name} failed.")
@@ -98,7 +88,6 @@ def archive_intermediates() -> None:
             continue
 
         destination = ARCHIVE_DIR / file_name
-
         if destination.exists():
             destination.unlink()
 
@@ -109,9 +98,7 @@ def archive_intermediates() -> None:
 
 def main() -> None:
     if not CONFIG_TEMPLATE.exists():
-        raise FileNotFoundError(
-            f"Missing {CONFIG_TEMPLATE.name}. Put it in the run folder."
-        )
+        raise FileNotFoundError(f"Missing {CONFIG_TEMPLATE.name}. Put it in the run folder.")
 
     scripts = prepare_run_folder()
 
