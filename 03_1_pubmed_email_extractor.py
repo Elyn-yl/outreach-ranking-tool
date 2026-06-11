@@ -2,6 +2,7 @@ from Bio import Entrez
 import pandas as pd
 import re
 import time
+from pathlib import Path
 
 from config import (
     NCBI_EMAIL,
@@ -27,7 +28,7 @@ def extract_emails(text):
 
     emails = re.findall(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-        text,
+        str(text),
     )
 
     cleaned = []
@@ -86,11 +87,50 @@ def fetch_pubmed_batch(batch_pmids, batch_label):
     return None
 
 
+def write_empty_outputs(reason):
+    print(reason)
+
+    candidate_cols = [
+        "Author", "Email Candidates", "PMID", "Year", "Title", "Journal", "Affiliation"
+    ]
+    summary_cols = [
+        "Author", "Email_Candidates", "Email_Source_PMIDs", "Example_Affiliation"
+    ]
+
+    pd.DataFrame(columns=candidate_cols).to_csv(
+        OUTPUT_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    pd.DataFrame(columns=summary_cols).to_csv(
+        SUMMARY_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(f"Saved empty {OUTPUT_FILE}")
+    print(f"Saved empty {SUMMARY_FILE}")
+
+
 def main():
-    df = pd.read_csv(INPUT_FILE)
+    if not Path(INPUT_FILE).exists():
+        write_empty_outputs(f"Input file not found: {INPUT_FILE}. Continuing with empty email outputs.")
+        return
+
+    try:
+        df = pd.read_csv(INPUT_FILE)
+    except Exception as e:
+        write_empty_outputs(f"Could not read {INPUT_FILE}: {e}. Continuing with empty email outputs.")
+        return
+
+    if df.empty:
+        write_empty_outputs(f"No papers found in {INPUT_FILE}. Continuing with empty email outputs.")
+        return
 
     if "PMID" not in df.columns:
-        raise ValueError(f"{INPUT_FILE} must contain a PMID column.")
+        write_empty_outputs(f"{INPUT_FILE} has no PMID column. Continuing with empty email outputs.")
+        return
 
     pmids = (
         df["PMID"]
@@ -99,6 +139,10 @@ def main():
         .unique()
         .tolist()
     )
+
+    if not pmids:
+        write_empty_outputs(f"No PMIDs found in {INPUT_FILE}. Continuing with empty email outputs.")
+        return
 
     print(f"Found {len(pmids)} PMIDs")
 
@@ -170,13 +214,7 @@ def main():
         time.sleep(0.5)
 
     expected_cols = [
-        "Author",
-        "Email Candidates",
-        "PMID",
-        "Year",
-        "Title",
-        "Journal",
-        "Affiliation",
+        "Author", "Email Candidates", "PMID", "Year", "Title", "Journal", "Affiliation"
     ]
 
     email_df = pd.DataFrame(rows)
