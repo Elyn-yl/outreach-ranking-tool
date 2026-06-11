@@ -1,4 +1,3 @@
-
 import re
 import time
 import unicodedata
@@ -21,10 +20,14 @@ from config import (
 )
 
 AUTHOR_AGG = AUTHOR_AGG_V2_FILE
-PAPERS_FILE = PAPERS_SCORED_FILE
-AFFILIATION_SUMMARY = AUTHOR_AFFILIATION_SUMMARY_FILE
-PUBMED_SUMMARY = AUTHOR_EMAIL_SUMMARY_FILE
-PUBMED_CANDIDATES = AUTHOR_EMAIL_CANDIDATES_FILE
+PAPERS_FILE = Path(PAPERS_SCORED_FILE)
+RUN_DIR = PAPERS_FILE.parent
+
+AFFILIATION_SUMMARY = Path(AUTHOR_AFFILIATION_SUMMARY_FILE)
+PUBMED_SUMMARY = Path(AUTHOR_EMAIL_SUMMARY_FILE)
+PUBMED_CANDIDATES = Path(AUTHOR_EMAIL_CANDIDATES_FILE)
+PUBLISHER_EMAILS = RUN_DIR / "publisher_corresponding_emails.csv"
+
 MASTER_CSV = AUTHOR_MASTER_FILE
 
 BATCH_SIZE = 100
@@ -135,10 +138,10 @@ def get_author_name(author_el):
 
 
 def build_affiliation_summary_if_possible():
-    if Path(AFFILIATION_SUMMARY).exists():
+    if AFFILIATION_SUMMARY.exists():
         return
 
-    if not Path(PAPERS_FILE).exists():
+    if not PAPERS_FILE.exists():
         print(f"Warning: {AFFILIATION_SUMMARY} and {PAPERS_FILE} not found.")
         return
 
@@ -241,6 +244,41 @@ def load_sources():
     return records_exact, records_sig
 
 
+def load_publisher_email_map():
+    """
+    Returns PMID -> publisher email rows.
+    These are preferred over PubMed affiliation emails because they are closer to
+    corresponding-author information from publisher pages.
+    """
+    if not PUBLISHER_EMAILS.exists():
+        return {}
+
+    try:
+        df = pd.read_csv(PUBLISHER_EMAILS)
+    except Exception:
+        return {}
+
+    if df.empty or "PMID" not in df.columns or "Corresponding_Email" not in df.columns:
+        return {}
+
+    out = defaultdict(list)
+    for _, row in df.iterrows():
+        email = clean(row.get("Corresponding_Email", "")).lower()
+        if "@" not in email:
+            continue
+
+        pmid = clean(row.get("PMID", ""))
+        out[pmid].append({
+            "email": email,
+            "author": clean(row.get("Corresponding_Author", "")),
+            "source": clean(row.get("Email_Source", "")),
+            "confidence": clean(row.get("Confidence", "")),
+            "url": clean(row.get("Resolved_URL", "")) or clean(row.get("Publisher_URL", "")),
+        })
+
+    return out
+
+
 def collect_email_candidates(df, records_exact, records_sig):
     all_rows = []
     candidate_map = {}
@@ -280,7 +318,56 @@ def collect_email_candidates(df, records_exact, records_sig):
     return candidate_map, evidence_map, usage, institution_usage
 
 
-def classify_email_for_author(author, email, usage, institution_usage):
+def publisher_email_for_author(row, publisher_map):
+    """
+    Only assign publisher email to a specific author if:
+    - the publisher corresponding author text matches the author name, OR
+    - exactly one publisher email exists for one of the author's representative PMIDs.
+    Otherwise keep it for review.
+    """
+    author = clean(row.get("Author", ""))
+    pmids = clean(row.get("Representative_PMIDs", ""))
+
+    pmid_list = [p.strip() for p in re.split(r";|\|", pmids) if p.strip()]
+
+    candidates = []
+    for pmid in pmid_list:
+        candidates.extend(publisher_map.get(pmid, []))
+
+    if not candidates:
+        return "", "", "", ""
+
+    candidates = list({c["email"]: c for c in candidates}.values())
+
+    # If corresponding author string matches author name, this is best.
+    for c in candidates:
+        corr_author = norm_name(c.get("author", ""))
+        current_author = norm_name(author)
+        if corr_author and current_author and (corr_author in current_author or current_author in corr_author):
+            return (
+                c["email"],
+                "publisher_corresponding_author_email",
+                "",
+                f'{c.get("source", "")}; {c.get("url", "")}',
+            )
+
+    # If only one corresponding email exists for the representative article(s), it is useful but still not fully author-confirmed.
+    if len(candidates) == 1:
+        c = candidates[0]
+        return (
+            c["email"],
+            "publisher_corresponding_email_article_level",
+            "",
+            f'{c.get("source", "")}; {c.get("url", "")}',
+        )
+
+    # Multiple publisher emails: show for review, do not assign to Best Email.
+    review = "; ".join(c["email"] for c in candidates)
+    evidence = "multiple publisher emails found for representative PMIDs"
+    return "", "publisher_email_needs_review", review, evidence
+
+
+def classify_affiliation_email_for_author(author, email, usage, institution_usage):
     if not email:
         return {"best_email": "", "status": "missing", "review_email": "", "score": 0}
 
@@ -330,6 +417,8 @@ def build_final_columns(df):
         "Preferred_Email",
         "Preferred_Email_Status",
         "Email_To_Review",
+        "Publisher_Email",
+        "Publisher_Email_Evidence",
         "Email_Match_Score",
         "Email_Evidence",
         "All_Email_Candidates",
@@ -365,6 +454,8 @@ def build_final_columns(df):
         "Preferred_Email": "Best Email",
         "Preferred_Email_Status": "Email Status",
         "Email_To_Review": "Email To Review",
+        "Publisher_Email": "Publisher Corresponding Email",
+        "Publisher_Email_Evidence": "Publisher Email Evidence",
         "Email_Match_Score": "Email Match Score",
         "All_Email_Candidates": "All Email Candidates",
         "Email_Evidence": "Email Evidence",
@@ -396,37 +487,57 @@ def main():
         return
 
     records_exact, records_sig = load_sources()
+    publisher_map = load_publisher_email_map()
     candidate_map, evidence_map, usage, institution_usage = collect_email_candidates(df, records_exact, records_sig)
 
     preferred_emails = []
     preferred_statuses = []
     review_emails = []
+    publisher_emails = []
+    publisher_evidence = []
     match_scores = []
     all_candidates = []
     evidence_lines = []
 
     for _, row in df.iterrows():
         author = clean(row.get("Author", ""))
+
+        pub_email, pub_status, pub_review, pub_ev = publisher_email_for_author(row, publisher_map)
+
         candidates = candidate_map.get(author, [])
         best_candidate, _ = choose_best_email(author, candidates)
 
-        classified = classify_email_for_author(
+        aff_classified = classify_affiliation_email_for_author(
             author=author,
             email=best_candidate,
             usage=usage,
             institution_usage=institution_usage,
         )
 
-        preferred_emails.append(classified["best_email"])
-        preferred_statuses.append(classified["status"])
-        review_emails.append(classified["review_email"])
-        match_scores.append(classified["score"])
+        if pub_email:
+            preferred_emails.append(pub_email)
+            preferred_statuses.append(pub_status)
+            review_emails.append(pub_review or aff_classified["review_email"])
+        else:
+            preferred_emails.append(aff_classified["best_email"])
+            if pub_status == "publisher_email_needs_review":
+                preferred_statuses.append(pub_status)
+                review_emails.append(pub_review)
+            else:
+                preferred_statuses.append(aff_classified["status"])
+                review_emails.append(aff_classified["review_email"])
+
+        publisher_emails.append(pub_email)
+        publisher_evidence.append(pub_ev)
+        match_scores.append(aff_classified["score"])
         all_candidates.append("; ".join(candidates))
         evidence_lines.append(evidence_map.get(author, ""))
 
     df["Preferred_Email"] = preferred_emails
     df["Preferred_Email_Status"] = preferred_statuses
     df["Email_To_Review"] = review_emails
+    df["Publisher_Email"] = publisher_emails
+    df["Publisher_Email_Evidence"] = publisher_evidence
     df["Email_Match_Score"] = match_scores
     df["All_Email_Candidates"] = all_candidates
     df["Email_Evidence"] = evidence_lines
@@ -437,29 +548,45 @@ def main():
     with pd.ExcelWriter(FINAL_XLSX, engine="openpyxl") as writer:
         if "Author Expertise Score" in final.columns:
             final.sort_values(by="Author Expertise Score", ascending=False).to_excel(
-                writer, sheet_name="Top Experts", index=False
+                writer,
+                sheet_name="Top Experts",
+                index=False,
             )
 
         if "Outreach Signal Score" in final.columns:
             final.sort_values(by="Outreach Signal Score", ascending=False).to_excel(
-                writer, sheet_name="Top Outreach Fits", index=False
+                writer,
+                sheet_name="Top Outreach Fits",
+                index=False,
             )
 
         if "Strategic Fit Score" in final.columns:
             final.sort_values(by="Strategic Fit Score", ascending=False).to_excel(
-                writer, sheet_name="Balanced Ranking", index=False
+                writer,
+                sheet_name="Balanced Ranking",
+                index=False,
             )
         else:
             final.to_excel(writer, sheet_name="Balanced Ranking", index=False)
 
-        if Path(PAPERS_FILE).exists():
+        if PAPERS_FILE.exists():
             papers = pd.read_csv(PAPERS_FILE)
             article_cols = [
                 "PMID", "Title", "Journal", "Year", "DOI", "PubMed_Link",
                 "DOI_Link", "Authors", "Relevance Score", "Matched Keywords"
             ]
             papers[[c for c in article_cols if c in papers.columns]].to_excel(
-                writer, sheet_name="Article Details", index=False
+                writer,
+                sheet_name="Article Details",
+                index=False,
+            )
+
+        if PUBLISHER_EMAILS.exists():
+            publisher_df = pd.read_csv(PUBLISHER_EMAILS)
+            publisher_df.to_excel(
+                writer,
+                sheet_name="Publisher Emails",
+                index=False,
             )
 
     print("DONE")

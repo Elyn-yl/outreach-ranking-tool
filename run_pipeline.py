@@ -12,6 +12,7 @@ SOURCE_SCRIPT_NAMES = [
     "01_pubmed_search+aggregation.py",
     "02_outreach_enrichment.py",
     "03_1_pubmed_email_extractor.py",
+    "03_2_publisher_corresponding_email_extractor.py",
     "04_email_enrichment_final_agg.py",
 ]
 
@@ -31,6 +32,7 @@ INTERMEDIATE_FILES = [
     "author_affiliation_summary.csv",
     "author_email_candidates.csv",
     "author_email_summary.csv",
+    "publisher_corresponding_emails.csv",
     "author_aggregation_master.csv",
 ]
 
@@ -39,10 +41,8 @@ def prepare_run_folder() -> list[Path]:
     """
     Copy pipeline scripts into this user's temporary run folder.
 
-    This is important because Python puts the script's folder first on sys.path.
-    If we run scripts from BASE_DIR, they may import BASE_DIR/config.py instead
-    of RUN_DIR/config.py. Running copied scripts from RUN_DIR guarantees each
-    user imports their own generated config.py.
+    Running copied scripts from RUN_DIR guarantees each user imports their own
+    generated config.py rather than a shared config.py from BASE_DIR.
     """
     if not READ_EXCEL_CONFIG_SOURCE.exists():
         raise FileNotFoundError(f"Missing script: {READ_EXCEL_CONFIG_SOURCE}")
