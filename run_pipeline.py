@@ -8,20 +8,18 @@ BASE_DIR = Path(__file__).resolve().parent
 RUN_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else BASE_DIR
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
-os.chdir(RUN_DIR)
-
-READ_EXCEL_CONFIG = BASE_DIR / "read_excel_config.py"
-CONFIG_TEMPLATE = RUN_DIR / "config_template_user_input.xlsx"
-CONFIG_FILE = RUN_DIR / "config.py"
-
-SCRIPTS = [
-    READ_EXCEL_CONFIG,
-    BASE_DIR / "01_pubmed_search+aggregation.py",
-    BASE_DIR / "02_outreach_enrichment.py",
-    BASE_DIR / "03_1_pubmed_email_extractor.py",
-    BASE_DIR / "04_email_enrichment_final_agg.py",
+SOURCE_SCRIPT_NAMES = [
+    "01_pubmed_search+aggregation.py",
+    "02_outreach_enrichment.py",
+    "03_1_pubmed_email_extractor.py",
+    "04_email_enrichment_final_agg.py",
 ]
 
+READ_EXCEL_CONFIG_SOURCE = BASE_DIR / "read_excel_config.py"
+READ_EXCEL_CONFIG_RUN = RUN_DIR / "read_excel_config.py"
+
+CONFIG_TEMPLATE = RUN_DIR / "config_template_user_input.xlsx"
+CONFIG_FILE = RUN_DIR / "config.py"
 FINAL_OUTPUT = RUN_DIR / "outreach_rankings.xlsx"
 ARCHIVE_DIR = RUN_DIR / "intermediate_outputs"
 
@@ -37,6 +35,35 @@ INTERMEDIATE_FILES = [
 ]
 
 
+def prepare_run_folder() -> list[Path]:
+    """
+    Copy pipeline scripts into this user's temporary run folder.
+
+    This is important because Python puts the script's folder first on sys.path.
+    If we run scripts from BASE_DIR, they may import BASE_DIR/config.py instead
+    of RUN_DIR/config.py. Running copied scripts from RUN_DIR guarantees each
+    user imports their own generated config.py.
+    """
+    if not READ_EXCEL_CONFIG_SOURCE.exists():
+        raise FileNotFoundError(f"Missing script: {READ_EXCEL_CONFIG_SOURCE}")
+
+    shutil.copy2(READ_EXCEL_CONFIG_SOURCE, READ_EXCEL_CONFIG_RUN)
+
+    run_scripts = [READ_EXCEL_CONFIG_RUN]
+
+    for name in SOURCE_SCRIPT_NAMES:
+        source = BASE_DIR / name
+        destination = RUN_DIR / name
+
+        if not source.exists():
+            raise FileNotFoundError(f"Missing script: {source}")
+
+        shutil.copy2(source, destination)
+        run_scripts.append(destination)
+
+    return run_scripts
+
+
 def run_script(script_path: Path) -> None:
     print(f"\nRunning {script_path.name}...")
 
@@ -44,7 +71,7 @@ def run_script(script_path: Path) -> None:
         raise FileNotFoundError(f"Missing script: {script_path}")
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(RUN_DIR) + os.pathsep + str(BASE_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(RUN_DIR) + os.pathsep + env.get("PYTHONPATH", "")
 
     args = [sys.executable, str(script_path)]
     if script_path.name == "read_excel_config.py":
@@ -86,7 +113,9 @@ def main() -> None:
             f"Missing {CONFIG_TEMPLATE.name}. Put it in the run folder."
         )
 
-    for script in SCRIPTS:
+    scripts = prepare_run_folder()
+
+    for script in scripts:
         run_script(script)
 
     if not CONFIG_FILE.exists():
