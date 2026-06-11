@@ -8,15 +8,11 @@ BASE_DIR = Path(__file__).resolve().parent
 RUN_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else BASE_DIR
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
-# IMPORTANT:
-# 03_2 publisher email extraction is intentionally disabled for now.
-# It can find article-level corresponding emails, but unless the corresponding
-# author name is reliably matched, it can incorrectly assign one email to every
-# author on the same paper.
 SOURCE_SCRIPT_NAMES = [
     "01_pubmed_search+aggregation.py",
     "02_outreach_enrichment.py",
     "03_1_pubmed_email_extractor.py",
+    "03_3_faculty_email_search.py",
     "04_email_enrichment_final_agg.py",
 ]
 
@@ -36,6 +32,7 @@ INTERMEDIATE_FILES = [
     "author_affiliation_summary.csv",
     "author_email_candidates.csv",
     "author_email_summary.csv",
+    "faculty_email_candidates.csv",
     "publisher_corresponding_emails.csv",
     "author_aggregation_master.csv",
 ]

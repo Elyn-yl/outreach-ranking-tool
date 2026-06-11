@@ -21,9 +21,13 @@ from config import (
 
 AUTHOR_AGG = AUTHOR_AGG_V2_FILE
 PAPERS_FILE = PAPERS_SCORED_FILE
+RUN_DIR = Path(PAPERS_FILE).parent
+
 AFFILIATION_SUMMARY = AUTHOR_AFFILIATION_SUMMARY_FILE
 PUBMED_SUMMARY = AUTHOR_EMAIL_SUMMARY_FILE
 PUBMED_CANDIDATES = AUTHOR_EMAIL_CANDIDATES_FILE
+FACULTY_EMAIL_CANDIDATES = RUN_DIR / "faculty_email_candidates.csv"
+
 MASTER_CSV = AUTHOR_MASTER_FILE
 
 BATCH_SIZE = 100
@@ -33,11 +37,9 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 BAD_EMAIL_PARTS = [
     "noreply", "no-reply", "example", "support", "webmaster", "privacy",
     "admin@", "info@", "newsletter", "media@", "press@", "careers@", "jobs@", "help@",
-    "editorial", "permissions", "rights", "advertising"
+    "editorial", "permissions", "rights", "advertising", "billing"
 ]
 
-# These domains are not automatically wrong, but they are too risky for automated outreach
-# unless the local-part strongly matches the author's name.
 LOW_TRUST_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
     "qq.com", "126.com", "163.com", "sina.com", "yeah.net"
@@ -93,11 +95,6 @@ def email_domain(email):
 
 
 def email_name_match_score(author, email):
-    """
-    Score how well the email local-part matches the author's name.
-    This is not proof, but it prevents obviously wrong shared/corresponding emails
-    from being assigned to unrelated coauthors.
-    """
     first, _, last = name_parts(author)
 
     if not first or not last or "@" not in email:
@@ -123,7 +120,6 @@ def email_name_match_score(author, email):
     if compact.startswith(first[0] + last[:4]):
         score += 8
 
-    # Institutional domain gives a very small boost only after name evidence exists.
     if email_domain(email) not in LOW_TRUST_DOMAINS and score > 0:
         score += 2
 
@@ -141,12 +137,6 @@ def choose_best_email(author, emails):
 
 
 def is_safe_best_email(author, email, email_usage):
-    """
-    Strict rule:
-    - email must appear for exactly one author in the aggregated dataset
-    - local part must clearly match the author's first/last name
-    This is intentionally conservative.
-    """
     if not email or "@" not in email:
         return False
 
@@ -247,7 +237,7 @@ def add_record(records_exact, records_sig, source, row):
             records[key]["evidence"].append(f"{source}: {e}")
 
 
-def load_sources():
+def load_pubmed_sources():
     records_exact = defaultdict(lambda: {"emails": [], "texts": [], "evidence": []})
     records_sig = defaultdict(lambda: {"emails": [], "texts": [], "evidence": []})
 
@@ -274,7 +264,56 @@ def load_sources():
     return records_exact, records_sig
 
 
-def collect_email_candidates(df, records_exact, records_sig):
+def load_faculty_email_candidates():
+    """
+    Returns Author -> faculty candidate dict.
+    Only rows already passing faculty search name-match logic are loaded.
+    """
+    if not FACULTY_EMAIL_CANDIDATES.exists():
+        return {}
+
+    try:
+        df = pd.read_csv(FACULTY_EMAIL_CANDIDATES)
+    except Exception as e:
+        print(f"Warning: could not read {FACULTY_EMAIL_CANDIDATES}: {e}")
+        return {}
+
+    if df.empty or "Author" not in df.columns or "Best Faculty Email" not in df.columns:
+        return {}
+
+    out = {}
+
+    for _, row in df.iterrows():
+        author = clean(row.get("Author", ""))
+        email = clean(row.get("Best Faculty Email", "")).lower()
+
+        if not author or "@" not in email:
+            continue
+
+        score = 0
+        try:
+            score = int(float(row.get("Email Match Score", 0)))
+        except Exception:
+            score = email_name_match_score(author, email)
+
+        if score < 18:
+            continue
+
+        existing = out.get(author)
+        candidate = {
+            "email": email,
+            "score": score,
+            "url": clean(row.get("Faculty Page URL", "")),
+            "evidence": clean(row.get("Evidence", "")),
+        }
+
+        if existing is None or score > existing["score"]:
+            out[author] = candidate
+
+    return out
+
+
+def collect_pubmed_email_candidates(df, records_exact, records_sig):
     candidate_map = {}
     evidence_map = {}
     email_to_authors = defaultdict(set)
@@ -304,22 +343,41 @@ def collect_email_candidates(df, records_exact, records_sig):
     return candidate_map, evidence_map, email_usage
 
 
-def build_email_columns(df, candidate_map, evidence_map, email_usage):
+def build_email_columns(df, pubmed_candidate_map, evidence_map, email_usage, faculty_map):
     best_emails = []
     statuses = []
     review_emails = []
     match_scores = []
+    evidence_lines = []
+
+    # Count faculty email usage too, to avoid assigning same found email to multiple authors.
+    faculty_usage = defaultdict(set)
+    for author, data in faculty_map.items():
+        faculty_usage[data["email"]].add(author)
+    faculty_usage = {email: len(authors) for email, authors in faculty_usage.items()}
 
     for _, row in df.iterrows():
         author = clean(row.get("Author", ""))
-        candidates = candidate_map.get(author, [])
-        best_candidate, score = choose_best_email(author, candidates)
+
+        faculty = faculty_map.get(author)
+
+        if faculty and faculty_usage.get(faculty["email"], 0) == 1:
+            best_emails.append(faculty["email"])
+            statuses.append("faculty_page_author_matched_email")
+            review_emails.append("")
+            match_scores.append(faculty["score"])
+            evidence_lines.append(f'faculty_page: {faculty["url"]}; {faculty["evidence"]}')
+            continue
+
+        pubmed_candidates = pubmed_candidate_map.get(author, [])
+        best_candidate, score = choose_best_email(author, pubmed_candidates)
 
         if is_safe_best_email(author, best_candidate, email_usage):
             best_emails.append(best_candidate)
-            statuses.append("author_matched_unique_email")
+            statuses.append("author_matched_unique_pubmed_affiliation_email")
             review_emails.append("")
             match_scores.append(score)
+            evidence_lines.append(evidence_map.get(author, ""))
         else:
             best_emails.append("")
             match_scores.append(score)
@@ -336,11 +394,16 @@ def build_email_columns(df, candidate_map, evidence_map, email_usage):
                 review_emails.append("")
                 statuses.append("missing")
 
+            if faculty and faculty_usage.get(faculty["email"], 0) > 1:
+                evidence_lines.append(f'faculty_email_shared_not_assigned: {faculty["email"]}; {faculty["url"]}')
+            else:
+                evidence_lines.append(evidence_map.get(author, ""))
+
     df["Preferred_Email"] = best_emails
     df["Preferred_Email_Status"] = statuses
     df["Email_To_Review"] = review_emails
     df["Email_Match_Score"] = match_scores
-    df["Email_Evidence"] = df["Author"].apply(lambda a: evidence_map.get(clean(a), ""))
+    df["Email_Evidence"] = evidence_lines
 
     return df
 
@@ -417,9 +480,17 @@ def main():
             pd.DataFrame().to_excel(writer, sheet_name="Balanced Ranking", index=False)
         return
 
-    records_exact, records_sig = load_sources()
-    candidate_map, evidence_map, email_usage = collect_email_candidates(df, records_exact, records_sig)
-    df = build_email_columns(df, candidate_map, evidence_map, email_usage)
+    records_exact, records_sig = load_pubmed_sources()
+    pubmed_candidate_map, evidence_map, email_usage = collect_pubmed_email_candidates(df, records_exact, records_sig)
+    faculty_map = load_faculty_email_candidates()
+
+    df = build_email_columns(
+        df=df,
+        pubmed_candidate_map=pubmed_candidate_map,
+        evidence_map=evidence_map,
+        email_usage=email_usage,
+        faculty_map=faculty_map,
+    )
 
     final = build_final_columns(df)
     df.to_csv(MASTER_CSV, index=False, encoding="utf-8-sig")
@@ -451,6 +522,10 @@ def main():
             papers[[c for c in article_cols if c in papers.columns]].to_excel(
                 writer, sheet_name="Article Details", index=False
             )
+
+        if FACULTY_EMAIL_CANDIDATES.exists():
+            faculty_df = pd.read_csv(FACULTY_EMAIL_CANDIDATES)
+            faculty_df.to_excel(writer, sheet_name="Faculty Email Candidates", index=False)
 
     print("DONE")
     print(f"Saved working file: {MASTER_CSV}")
