@@ -12,7 +12,6 @@ SOURCE_SCRIPT_NAMES = [
     "01_pubmed_search+aggregation.py",
     "02_outreach_enrichment.py",
     "03_1_pubmed_email_extractor.py",
-    "03_3_faculty_email_search.py",
     "04_email_enrichment_final_agg.py",
 ]
 
